@@ -37,13 +37,36 @@
 		};
 	};
 
+	security {
+		compatible = "sec,max3255x";
+		sec-power = <&msm_gpio 37 0>;
+		sec-reset = <&msm_gpio 98 0>;
+		sec-wakeup = <&msm_gpio 118 0>;
+	};
+
+	printer-pt48d {
+		compatible = "printer,pt48d";
+		prn-steps = <48>;
+		prn-dpwr-en = <&msm_gpio 17 0>;
+		prn-ppwr-en = <&msm_gpio 16 0>;
+		prn-mctl-a = <&msm_gpio 115 0>;
+		prn-mctl-na = <&msm_gpio 111 0>;
+		prn-mctl-b = <&msm_gpio 116 0>;
+		prn-mctl-nb = <&msm_gpio 114 0>;
+		prn-mosi = <&msm_gpio 8 0>;
+		prn-strobe = <&msm_gpio 9 0>;
+		prn-latch = <&msm_gpio 10 0>;
+		prn-clk = <&msm_gpio 11 0>;
+		prn-th-alarm = <&msm_gpio 14 0>;
+	};
+	
 	sound {
 		compatible = "qcom,msm8x16-audio-codec";
 		qcom,model = "msm8x16-skui-snd-card";
 		qcom,msm-snd-card-id = <0>;
 		qcom,msm-ext-pa = "primary";
 		qcom,msm-codec-type = "internal";
-		qcom,msm-mbhc-hphl-swh = <1>;
+		qcom,msm-mbhc-hphl-swh = <0>;
 		qcom,msm-mbhc-gnd-swh = <0>;
 		qcom,msm-hs-micbias-type = "internal";
 		qcom,audio-routing =
