@@ -1,0 +1,2106 @@
+
+#include <mml.h>
+#include <mml_tmr.h>
+#include <mml_intc.h>
+#include <mml_gpio.h>
+#include <mml_uart.h>
+
+#include "printer_dev.h"
+#include "printer_timer.h"
+#include "printer_queue.h"
+#include "printer_dbg.h"
+
+#include "menu/menu.h"
+
+
+#define prt_dbg			//uart_printk
+#define Prt_Return(_x_)	do { if(_x_){prt_dbg("<line:%d> %s <Err:%d>\r\n", __LINE__, __FUNCTION__, _x_);} return (_x_); } while(0)
+
+#define HEAT_INT_TIME			125
+
+typedef struct{
+	unsigned char dots[BYTES_PER_LINE];	// 保存一个点行的数组数据
+	unsigned char byte[BLOCK_PER_LINE]; // 记录每个分块的byte位置
+	unsigned char bit[BLOCK_PER_LINE];  // 记录每个分块的bit位置
+	unsigned char blocks;				// 记录总的块数
+	unsigned short heatTime;
+}T_DotLine;
+
+typedef struct prt_ctrl_t{
+	T_DotLine line[2];
+	T_DotLine *pCur;
+	T_DotLine *pNext;
+	unsigned char dotBlock[BYTES_PER_LINE];
+	unsigned char useSet;		//use to indicate the array offset
+	unsigned char curBlock;		//current heat block
+	unsigned char halfDot;
+	unsigned char heating;
+	
+	unsigned short stepTime;
+	unsigned short lastStepTime;
+	
+	unsigned int condition;
+	unsigned int nextCondition;
+	
+	unsigned int stepCnt;			//motor stepCnt
+	unsigned int preStepCnt;
+	unsigned int finishStepCnt;
+	unsigned int feedStepCnt;
+	
+	unsigned int flag;
+	unsigned int cutStep;
+	unsigned int iCurLine;
+	
+	int inited;
+	int last_err;
+	int gray;
+
+
+	T_PrinterDriver *pDrv;
+}T_PrtDevCtrl;
+
+typedef struct{
+	unsigned int condition;
+	int (*pFunc)(T_PrtDevCtrl *prt_ctrl);
+}T_PrtMotorCtrl;
+
+
+// !!!!just for debug!!!!!
+static volatile mml_uart_regs_t *reg_uart = (volatile mml_uart_regs_t*)MML_UART0_IOBASE;
+
+// what the fck!!
+#define PRT_GET_FCK_TICK()		*(volatile unsigned int *)( MML_TMR3_IOBASE + 0 )
+
+static volatile int gFinishFill = 0;
+static unsigned char gDotNum[256];
+const static unsigned char gCharDotTab[] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+static int gLastLineDotNum = 0;
+static int gContinusBlackLine=0;
+
+// global control parameter
+static volatile T_PrtDevCtrl gtPrtDevCtrl;
+static volatile T_PrtDevCtrl *gpPrtDevCtrl = &gtPrtDevCtrl;
+
+// for motor timer handler event!!!
+typedef enum{
+	ePrtMotorInit = 0,
+	ePrtMotorStep,
+	ePrtMotorPreStep,
+	ePrtMotorPhase1,
+	ePrtMotorPhase2,
+	ePrtMotorPhase3,
+	ePrtMotorPhase4,
+	ePrtMotorFinishStep,
+	ePrtMotorWait,	
+	ePrtMotorStop,
+}E_PrtMotorCondition;
+
+
+#define MotorTimerSet(us)		prtTimerStart(MOTOR, us)
+#define HeatTimerSet(us)		prtTimerStart(HEAT, us)
+#define MotorTimerStop()		prtTimerStop(MOTOR)
+#define HeatTimerStop()			prtTimerStop(HEAT)
+
+static void prtInitCharDots(void)
+{
+	int i;
+	for(i=0; i<=0xff; i++)
+	{
+		gDotNum[i] = gCharDotTab[i&0x0f] + gCharDotTab[(i>>4)&0x0f];
+	}
+}
+
+static int prtDevCheckFillFinish(void)
+{
+	return gFinishFill;
+}
+
+static T_PrtDevCtrl *prtDevGetGlobalCtrl(void)
+{
+	return gpPrtDevCtrl;
+}
+
+static void prtDevCalcStepTime(T_PrtDevCtrl *prtDevCtrl)
+{
+
+}
+
+static int prtDevGetDotLineData(T_PrtDevCtrl *prtDevCtrl)
+{
+	int ret;
+	char *pBuf;
+
+	pBuf = prtDevCtrl->pNext->dots;
+	ret  = prtQueGetBuf(pBuf, BYTES_PER_LINE);
+	if (ret != BYTES_PER_LINE)	//no data
+	{
+		memset(pBuf, 0, BYTES_PER_LINE);
+		return 0;
+	}
+	else
+	{
+		prtDevCtrl->iCurLine++;
+		return 1;
+	}
+}
+/*
+按可以允许的最大加热点数来分块，
+这里只是记录下来分块的位置
+*/
+static int prtDevSplitBlocks(T_PrtDevCtrl *prtDevCtrl)
+{
+	int i, j, offset;
+	int cnt, total;
+	int block_dots;	// 每个分块的点数
+	unsigned char *pDotLine;
+	unsigned char ch;
+
+	pDotLine = prtDevCtrl->pNext->dots;	
+
+	if (prtDevCtrl->pDrv->mask & MASK_PRT_DOT_ADJ)
+	{
+		if(gLastLineDotNum > prtDevCtrl->pDrv->normalAdjHeatDot)
+		{
+			block_dots = prtDevCtrl->pDrv->normalHeatDot;
+		}
+		else
+		{
+			block_dots = 2*prtDevCtrl->pDrv->normalHeatDot;
+		}
+		gLastLineDotNum = 0;
+	} 
+	else 
+	{
+		block_dots = prtDevCtrl->pDrv->normalHeatDot;
+	}
+
+	if (prtDevCtrl->pDrv->mask & MASK_PRT_BLACK_ADJ)
+	{
+		if(gContinusBlackLine >= prtDevCtrl->pDrv->blackAdjLine)
+		{
+			gContinusBlackLine  = prtDevCtrl->pDrv->blackAdjLine;
+			block_dots = prtDevCtrl->pDrv->blackAdjHeatDot;
+		}
+	}
+
+	cnt = 0;
+	total = 0;
+	offset = 1;
+	memset(prtDevCtrl->pNext->byte, 0, sizeof(prtDevCtrl->pNext->byte));
+	memset(prtDevCtrl->pNext->bit, 0, sizeof(prtDevCtrl->pNext->bit));
+	
+	for(i=0; i<BYTES_PER_LINE; i++)
+	{
+		total += gDotNum[pDotLine[i]];	// 这一个行的总点数
+		
+		if (cnt == block_dots)
+		{
+			prtDevCtrl->pNext->byte[offset] = i;
+			prtDevCtrl->pNext->bit[offset] = 0;
+			offset++;
+			cnt = gDotNum[pDotLine[i]];
+		}
+		else if (cnt < block_dots)
+		{
+			if ((cnt + gDotNum[pDotLine[i]]) > block_dots)
+			{
+				ch = pDotLine[i];
+				for(j=0; j<8; j++)
+				{
+					if ( (cnt+gDotNum[ch >> j]) == block_dots)
+					{
+						break;
+					}
+				}
+	
+				prtDevCtrl->pNext->byte[offset] = i;
+				prtDevCtrl->pNext->bit[offset] = j;
+				offset++;
+				// 一个byte剩下的几个bit，算到下一个分块里
+				cnt = gDotNum[(ch << (8- j)) & 0xff];
+			}
+			else
+			{
+				cnt += gDotNum[pDotLine[i]];
+			}
+		}
+	}
+
+	if (prtDevCtrl->pDrv->mask & MASK_PRT_BLACK_ADJ)
+	{
+		if(total >= BLACK_LINE_UPPER)
+		{
+			gContinusBlackLine++;
+		}
+		else if(total < BLACK_LINE_LOWER)
+		{
+			if(gContinusBlackLine) 
+				gContinusBlackLine--;
+		}
+	}
+
+	if (prtDevCtrl->pDrv->mask & MASK_PRT_DOT_ADJ)
+		gLastLineDotNum = total;
+
+	if(total == 0)
+		prtDevCtrl->pNext->blocks = 0;
+	else
+		prtDevCtrl->pNext->blocks = (total - 1)/block_dots + 1;
+
+	return prtDevCtrl->pNext->blocks;
+}
+/*
+把分块数据取出来
+*/
+static int prtDevGetBlockData(T_PrtDevCtrl *prtDevCtrl, int isCurrent, int index)
+{
+	int bs, be, os, oe, cnt;
+	int i, dots;
+	T_DotLine *pLine;
+	
+	if(isCurrent == 1)
+	{
+		pLine = prtDevCtrl->pCur;
+	}
+	else
+	{
+		pLine = prtDevCtrl->pNext;
+	}
+
+	memset((unsigned char *)prtDevCtrl->dotBlock, 0, BYTES_PER_LINE);
+
+	if(pLine->blocks == 0)
+		return 0;
+	
+	bs = pLine->byte[index];
+	os = pLine->bit[index];
+
+	if(index+1 == pLine->blocks)
+	{
+		be = BYTES_PER_LINE;
+		oe = 0;
+	}
+	else
+	{
+		be = pLine->byte[index+1];
+		oe = pLine->bit[index+1];
+	}
+	cnt = be - bs;
+	
+	memcpy((unsigned char *)prtDevCtrl->dotBlock+bs, pLine->dots+bs, cnt);
+
+	if(os)
+		prtDevCtrl->dotBlock[bs] = ((pLine->dots[bs] << (8-os))&0xff) >> (8-os);
+	if(oe)
+		prtDevCtrl->dotBlock[be] = (pLine->dots[be] >> oe) << oe;
+
+	cnt = (oe ? be+1 : be);
+	for(i=bs,dots=0; i<cnt; i++)
+	{
+		dots += gDotNum[prtDevCtrl->dotBlock[i]];
+	}
+	return dots;
+}
+
+static void prtDevGetHeatTime(T_PrtDevCtrl *prtDevCtrl)
+{	
+	if(prtDevCtrl->pCur->blocks > 0)
+	{
+		prtDevCtrl->pCur->heatTime = prtDevCtrl->pDrv->getHeatTime(prtDevCtrl->gray);
+	}
+	else
+	{
+		prtDevCtrl->pCur->heatTime = 0;
+	}
+}
+
+static void prtDevGetStepTime(T_PrtDevCtrl *prtDevCtrl)
+{
+	int t, i;
+	int min;
+#if 0
+	// 预走纸 或者 单走纸的情况下，都按照加速表进行加速
+	if( prtDevCtrl->condition == ePrtMotorPreStep || prtDevCtrl->condition == ePrtMotorStep )
+	{
+		if (prtDevCtrl->stepCnt < prtDevCtrl->pDrv->stepTabCnt)
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->stepCnt];
+		}
+		else
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+		}
+	}
+	else if ( prtDevCtrl->condition == ePrtMotorFinishStep ) // 打印后走纸
+	{
+		for(i=0; i<prtDevCtrl->pDrv->stepTabCnt; i++)
+		{
+			if (prtDevCtrl->pDrv->stepTab[i] < prtDevCtrl->lastStepTime)
+				break;
+		}
+		if (i == prtDevCtrl->pDrv->stepTabCnt)
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+		}
+		else
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[i];
+		}
+	}
+	else // 打印时走纸
+	{
+		if (prtDevCtrl->pDrv->mask & MASK_PRT_HEAT_TWINCE)
+		{
+			// 如果是每行加热两次，则两个步进的时间约等于总加热时间
+			t = ((prtDevCtrl->pCur->heatTime + HEAT_INT_TIME + prtDevCtrl->pDrv->waittime)*prtDevCtrl->pCur->blocks) / 2;		//will ratate 2 phase
+		}
+		else
+		{
+			// 如果是每行加热一次，则四个步进的时间约等于总加热时间
+			t = ((prtDevCtrl->pCur->heatTime + HEAT_INT_TIME + prtDevCtrl->pDrv->waittime)*prtDevCtrl->pCur->blocks + 100) / 4; 	//will ratate 4 phase while heating
+		}
+		
+		
+		//prt_dbg_add("LST", prtDevCtrl->lastStepTime);
+		if (t < prtDevCtrl->lastStepTime) // 如果加热的时间比上一次步进的时间要少，那么就可以加速一下
+		{
+			for(i=0; i<prtDevCtrl->pDrv->stepTabCnt; i++)
+			{
+				if (prtDevCtrl->pDrv->stepTab[i] < prtDevCtrl->lastStepTime)
+					break;
+			}
+		
+			if (i == prtDevCtrl->pDrv->stepTabCnt)
+				min = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+			else
+				min = prtDevCtrl->pDrv->stepTab[i];
+		
+			if (t < min)
+				t = min;			
+		}
+		
+		prtDevCtrl->stepTime = t;	
+	}
+	
+	if (prtDevCtrl->stepTime < prtDevCtrl->pDrv->minStepTime)
+		prtDevCtrl->stepTime = prtDevCtrl->pDrv->minStepTime;
+
+	prtDevCtrl->lastStepTime = prtDevCtrl->stepTime;
+#endif
+
+#if 1
+	if(prtDevCtrl->stepCnt <= prtDevCtrl->preStepCnt)		//pre step
+	{		
+		if (prtDevCtrl->stepCnt < prtDevCtrl->pDrv->stepTabCnt)
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->stepCnt];
+		}
+		else
+		{
+			prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+		}
+	}
+	else //according the heat time and last step time
+	{
+		if(prtDevCtrl->condition == ePrtMotorStep)	//only rotate the motor
+		{
+			if (prtDevCtrl->stepCnt < prtDevCtrl->pDrv->stepTabCnt)
+			{
+				prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->stepCnt];
+			}
+			else
+			{
+				prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+			}
+		}
+		else if (prtDevCtrl->condition == ePrtMotorFinishStep) // 打印后走纸
+		{
+			for(i=0; i<prtDevCtrl->pDrv->stepTabCnt; i++)
+			{
+				if (prtDevCtrl->pDrv->stepTab[i] < prtDevCtrl->lastStepTime)
+					break;
+			}
+			if (i == prtDevCtrl->pDrv->stepTabCnt)
+				prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+			else
+				prtDevCtrl->stepTime = prtDevCtrl->pDrv->stepTab[i];
+			
+		}
+		else // 打印时走纸
+		{
+			if (prtDevCtrl->pDrv->mask & MASK_PRT_HEAT_TWINCE)
+			{
+				// 如果是每行加热两次，则两个步进的时间约等于总加热时间
+				t = ((prtDevCtrl->pCur->heatTime + HEAT_INT_TIME + prtDevCtrl->pDrv->waittime)*prtDevCtrl->pCur->blocks) / 2;		//will ratate 2 phase
+			}
+			else
+			{
+				// 如果是每行加热一次，则四个步进的时间约等于总加热时间
+				t = ((prtDevCtrl->pCur->heatTime + HEAT_INT_TIME + prtDevCtrl->pDrv->waittime)*prtDevCtrl->pCur->blocks + 100) / 4;		//will ratate 4 phase while heating
+			}
+
+			
+			//prt_dbg_add("LST", prtDevCtrl->lastStepTime);
+			if (t < prtDevCtrl->lastStepTime)
+			{
+				for(i=0; i<prtDevCtrl->pDrv->stepTabCnt; i++)
+				{
+					if (prtDevCtrl->pDrv->stepTab[i] < prtDevCtrl->lastStepTime)
+						break;
+				}
+
+				if (i == prtDevCtrl->pDrv->stepTabCnt)
+					min = prtDevCtrl->pDrv->stepTab[prtDevCtrl->pDrv->stepTabCnt-1];
+				else
+					min = prtDevCtrl->pDrv->stepTab[i];
+
+				if (t < min)
+					t = min;			
+			}
+
+			prtDevCtrl->stepTime = t;	
+		}
+	}
+
+	if (prtDevCtrl->stepTime < prtDevCtrl->pDrv->minStepTime)
+		prtDevCtrl->stepTime = prtDevCtrl->pDrv->minStepTime;
+
+	prtDevCtrl->lastStepTime = prtDevCtrl->stepTime;
+
+	//prt_dbg_add("FST", prtDevCtrl->stepTime);
+#endif
+}
+
+static void prtDevSendAndLatchData(T_PrtDevCtrl *prtDevCtrl)
+{
+	prtDevCtrl->pDrv->load((unsigned char *)prtDevCtrl->dotBlock);
+	prtDevCtrl->pDrv->latch();
+}
+
+static void prtUpdateLine(T_PrtDevCtrl *prtDevCtrl)
+{
+	T_DotLine *ptr;
+
+	ptr = prtDevCtrl->pCur;
+	prtDevCtrl->pCur = prtDevCtrl->pNext;
+	prtDevCtrl->pNext = ptr;
+}
+
+// --------------------------------------------------------------------------
+
+static int prtMotorInit_z(T_PrtDevCtrl *prtDevCtrl)
+{	
+	int ret;
+
+	prtDevGetStepTime( prtDevCtrl );
+	
+	if(prtDevCtrl->preStepCnt > 0)	// 如果需要与走纸，则预走纸
+	{
+		prtDevCtrl->condition = ePrtMotorPreStep;
+	}
+	else	// 不需要预走纸
+	{
+		// 如果没有数据，则看一下是否等待
+		if( prtQueCheckLines() == 0x00 ) // no data
+		{
+			//prtDevStop( PRT_ERR_NODATA );
+			//MotorTimerSet( 200 );
+			if( prtDevCheckFillFinish() == 0x00) // 没数据，也没填充完成，则进入等待状态
+			{
+				prtDevCtrl->condition = ePrtMotorWait;
+			}
+			else
+			{
+				prtDevCtrl->condition = ePrtMotorFinishStep;
+			}
+			//Prt_Return ( PRT_OK );
+		}
+		else
+		{
+			prtDevCtrl->condition = ePrtMotorPhase1;
+			
+			prtDevGetDotLineData( prtDevCtrl );
+			prtDevSplitBlocks( prtDevCtrl );
+			prtDevGetBlockData( prtDevCtrl, 0, 0 );
+			prtDevSendAndLatchData( prtDevCtrl );
+		}
+	}
+	
+	prtDevCtrl->pDrv->step();
+	MotorTimerSet(prtDevCtrl->stepTime);
+	prtDevCtrl->stepCnt++;
+	prtDevGetStepTime( prtDevCtrl );
+
+	//prt_dbg_add("SInit", prtDevCtrl->condition);
+
+	Prt_Return ( PRT_OK );
+}
+
+static int prtMotorStep_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	
+	prtDevCtrl->pDrv->step();
+	MotorTimerSet(prtDevCtrl->stepTime);
+	prtDevCtrl->stepCnt++;
+	prtDevGetStepTime( prtDevCtrl );
+	prt_dbg_add("ST_FT", prtDevCtrl->stepTime);
+	
+	if( prtDevCtrl->feedStepCnt-- == 0 )
+	{
+		prtDevCtrl->condition = ePrtMotorStop ;
+	}
+
+	Prt_Return ( PRT_OK );
+}
+
+static int prtMotorPreStep_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	prtDevCtrl->pDrv->step();	
+	MotorTimerSet(prtDevCtrl->stepTime);
+	prtDevCtrl->stepCnt++;
+
+	// 预走纸完了之后
+	switch (prtDevCtrl->preStepCnt - prtDevCtrl->stepCnt)
+	{
+	case 2:
+		//prtDevGetDotLineData( prtDevCtrl );
+		break;
+	case 1: 	
+		//prtDevSplitBlocks( prtDevCtrl );
+		break;
+	case 0:
+		// 预走纸完了，在这里看一下是否有数据?
+		if( prtQueCheckLines() == 0x00 ) // no data
+		{
+			//prtDevStop( PRT_ERR_NODATA );
+			//MotorTimerSet( 200 );
+			if( prtDevCheckFillFinish() == 0x00) // 没数据，也没填充完成，则进入等待状态
+			{
+				prtDevCtrl->condition = ePrtMotorWait;
+			}
+			else
+			{
+				prtDevCtrl->condition = ePrtMotorFinishStep;
+			}
+			//Prt_Return ( PRT_OK );
+		}
+		else
+		{
+			prtDevGetDotLineData( prtDevCtrl );
+			prtDevSplitBlocks( prtDevCtrl );
+			
+			prtDevGetBlockData( prtDevCtrl, 0, 0);
+			prtDevSendAndLatchData( prtDevCtrl );
+			prtDevCtrl->condition = ePrtMotorPhase1;
+		}
+		break;
+	}
+	
+	prtDevGetStepTime( prtDevCtrl );
+
+	Prt_Return ( PRT_OK );
+}
+
+
+static int prtMotorPhase1_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	int temp;
+	volatile unsigned int s, e, d;
+
+
+	if(prtDevCtrl->heating == 1)	//it's mustn't in it
+	{
+		prt_dbg_add("S1_WT", 1);
+		
+		MotorTimerSet(100);
+		prtDevCtrl->lastStepTime += 100;
+		
+		Prt_Return ( PRT_OK );
+	}
+	prtDevCtrl->pDrv->step();
+	prtDevCtrl->stepCnt++;
+	
+	s = PRT_GET_FCK_TICK();//usecGetTick();
+	
+	prtUpdateLine( prtDevCtrl );
+
+	prtDevGetHeatTime( prtDevCtrl );
+	prtDevGetStepTime( prtDevCtrl );
+
+	
+	prtDevCtrl->curBlock = 0;
+	prtDevCtrl->halfDot = 0;
+
+	if(prtDevCtrl->pCur->blocks > 0)
+	{
+		prtDevCtrl->pDrv->stbControl(1);	//start to heat
+		prtDevCtrl->heating = 1;
+		prtDevCtrl->halfDot = 0;
+		
+		prt_dbg_add("S1_HT", prtDevCtrl->pCur->heatTime);
+		
+		HeatTimerSet(prtDevCtrl->pCur->heatTime);
+	}
+	/*
+	else
+	{
+		prtGetBlockData(0, 0);
+		prtSendAndLatchData();
+	}
+	*/
+
+	#if 0
+	e = PRT_GET_FCK_TICK();//usecGetTick();
+	d = (e > s)?(e - s):(0xffffffff-s+e);
+	d = d * 185 / 10000;
+
+	//prt_dbg_add("S1_ST1", prtDevCtrl->stepTime);
+	
+	//prt_dbg_add("S1_s", s);
+	//prt_dbg_add("S1_e", e);
+	//prt_dbg_add("S1_d", d);
+	
+	if(d > prtDevCtrl->stepTime)
+		d = 10;
+	else
+		d = prtDevCtrl->stepTime-d;
+	#endif
+	//prt_dbg_add("S1_ST2", d);
+	
+	//MotorTimerSet(d);
+	MotorTimerSet(prtDevCtrl->stepTime);
+	
+	prt_dbg_add("S1_ST", prtDevCtrl->stepTime);
+	
+#if 0
+	temp = prtDevCtrl->pDrv->getTemprature();
+	if(temp >= prtDevCtrl->pDrv->damageTemprature)
+	{
+		prtDevStop( PRT_ERR_OVERHEAT );
+		Prt_Return ( PRT_ERR_OVERHEAT );
+	}
+#endif	
+	prtDevCtrl->condition = ePrtMotorPhase2;
+	
+	Prt_Return ( PRT_OK );
+}
+
+
+static int prtMotorPhase2_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	prtDevCtrl->pDrv->step();
+	prtDevCtrl->stepCnt++;
+	MotorTimerSet(prtDevCtrl->stepTime);
+	//prt_dbg_add("S2_ST", prtDevCtrl->stepTime);
+	prtDevCtrl->condition = ePrtMotorPhase3;
+	
+	if ( prtDevGetDotLineData( prtDevCtrl ) == 0 )	//no data, finish
+	{
+		//prtDevCtrl->condition = ePrtMotorFinishStep;
+		if( prtDevCheckFillFinish() == 0x00 )	// 没有填充完成，那就去等一下吧~~~~(>_<)~~~~
+		{
+			prtDevCtrl->condition = ePrtMotorWait;
+		}
+		else
+		{
+			prtDevCtrl->condition = ePrtMotorFinishStep;
+		}
+	}
+	else
+	{
+		prtDevSplitBlocks(prtDevCtrl);
+
+		prtDevCtrl->nextCondition = ePrtMotorPhase1;
+	}
+
+	Prt_Return ( PRT_OK );
+}
+
+
+static int prtMotorPhase3_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	if((prtDevCtrl->pDrv->mask & MASK_PRT_HEAT_TWINCE) && (prtDevCtrl->heating == 1))	//it's mustn't in it
+	{
+		prt_dbg_add("S3_WT", 1);
+
+		MotorTimerSet(100);
+		prtDevCtrl->lastStepTime += 100;
+
+		Prt_Return ( PRT_OK );
+	}
+	prtDevCtrl->pDrv->step();
+	prtDevCtrl->stepCnt++;
+	MotorTimerSet(prtDevCtrl->stepTime);
+	//prt_dbg_add("S3_ST", prtDevCtrl->stepTime);
+
+	if(prtDevCtrl->pDrv->mask & MASK_PRT_HEAT_TWINCE)
+	{
+		prtDevCtrl->curBlock = 0;
+		prtDevCtrl->halfDot = 1;
+
+		if(prtDevCtrl->pCur->blocks > 0)
+		{
+			prtDevCtrl->pDrv->stbControl(1);	//start to heat
+			prtDevCtrl->heating = 1;
+			prt_dbg_add("S3_HT", prtDevCtrl->pCur->heatTime);
+			HeatTimerSet(prtDevCtrl->pCur->heatTime);
+		}
+		/*
+		else
+		{
+			
+			prtGetBlockData(0, tPrtCtl.curBlock);
+			prtSendAndLatchData();
+		}
+		*/
+	}
+	
+	prtDevCtrl->condition = ePrtMotorPhase4;
+	
+	Prt_Return ( PRT_OK );
+}
+
+
+static int prtMotorPhase4_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	prtDevCtrl->pDrv->step();
+	prtDevCtrl->stepCnt++;
+	MotorTimerSet(prtDevCtrl->stepTime);
+	//prt_dbg_add("S4_ST", prtDevCtrl->stepTime);
+	
+	if(prtDevCtrl->pCur->blocks == 0)
+	{
+		prtDevGetBlockData(prtDevCtrl, 0, 0);
+		prtDevSendAndLatchData(prtDevCtrl);
+	}
+	prtDevCtrl->condition = prtDevCtrl->nextCondition;
+	
+	Prt_Return ( PRT_OK );
+}
+
+
+static int prtMotorWait_z(T_PrtDevCtrl *prtDevCtrl)
+{	
+	if ( prtDevGetDotLineData( prtDevCtrl ) == 0 )	//no data
+	{
+		//prtDevStop( PRT_ERR_NODATA );
+		//Prt_Return ( PRT_ERR_NODATA );
+		if( prtDevCheckFillFinish() == 0x00 ) // 没有填充完成，继续等
+		{
+			prtDevCtrl->pDrv->init();
+			prtDevCtrl->condition = ePrtMotorWait;
+			MotorTimerSet(100);
+			prt_dbg_add("WAIT_D", 100);
+		}
+		else
+		{
+			prtDevCtrl->pDrv->powerControl( 1 );
+			prtDevCtrl->condition = ePrtMotorFinishStep;
+			MotorTimerSet(100);
+			prt_dbg_add("WAIT_E", 100);
+		}
+	}
+	else
+	{
+		prtDevCtrl->pDrv->powerControl( 1 );
+
+		prtDevSplitBlocks( prtDevCtrl );
+		prtDevGetBlockData( prtDevCtrl, 0, 0);
+		prtDevSendAndLatchData( prtDevCtrl );
+
+		prtDevCtrl->condition = ePrtMotorPhase1;
+		MotorTimerSet(100);
+		prt_dbg_add("WAIT_R", 100);
+	}
+	Prt_Return ( PRT_OK );
+}
+
+static int prtMotorStop_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	if(prtDevCtrl->heating == 1)	//it's mustn't in it
+	{
+		MotorTimerSet(50);
+		Prt_Return ( PRT_OK );
+	}
+
+	if(prtDevCtrl->last_err == PRT_ERR_BUSY)
+		prtDevCtrl->last_err = PRT_OK;
+
+	prtDevStop( PRT_OK );
+
+	Prt_Return ( PRT_OK );
+}
+
+static int prtMotorFinishStep_z(T_PrtDevCtrl *prtDevCtrl)
+{
+	if(prtDevCtrl->heating == 1)
+	{
+		MotorTimerSet(50);
+		Prt_Return ( PRT_OK );
+	}
+
+	if( prtDevCtrl->finishStepCnt-- == 0 )
+	{
+		prtDevStop( PRT_OK );
+		Prt_Return ( PRT_OK );
+	}
+	
+	prtDevCtrl->pDrv->step();	
+	MotorTimerSet(prtDevCtrl->stepTime);
+	prtDevCtrl->stepCnt++;
+	prtDevGetStepTime( prtDevCtrl );
+
+	prt_dbg_add("FF_ST", prtDevCtrl->stepTime);
+
+	Prt_Return ( PRT_OK );
+}
+
+T_PrtMotorCtrl tPrtMotorCtrlTab[] = {
+	{ePrtMotorInit, prtMotorInit_z},
+	{ePrtMotorStep, prtMotorStep_z},
+	{ePrtMotorPreStep, prtMotorPreStep_z},
+	{ePrtMotorPhase1, prtMotorPhase1_z},
+	{ePrtMotorPhase2, prtMotorPhase2_z},
+	{ePrtMotorPhase3, prtMotorPhase3_z},
+	{ePrtMotorPhase4, prtMotorPhase4_z},
+	{ePrtMotorWait, prtMotorWait_z},
+	{ePrtMotorStop, prtMotorStop_z},
+	{ePrtMotorFinishStep, prtMotorFinishStep_z},
+};
+
+
+static void prtDevMotorTimerHandler(void)
+{
+	unsigned char ch;
+	int i, ret, cnt;
+	T_PrtDevCtrl *pPrtDevCtrl;
+
+
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	//reg_uart->dr = pPrtDevCtrl->condition;
+	//prt_dbg_add("ISR_C", pPrtDevCtrl->condition);
+	
+	if( pPrtDevCtrl->pDrv->checkPaper() == 0x00 )	// have no paper
+	{
+		prtDevStop( PRT_ERR_NOPAPER );
+		return  ;
+	}
+	if( pPrtDevCtrl->pDrv->getTemprature() >= pPrtDevCtrl->pDrv->maxTemprature ) // overtemperature
+	{
+		prtDevStop( PRT_ERR_OVERHEAT );
+		return  ;
+	}
+	if( pPrtDevCtrl->pDrv->getVoltage() < pPrtDevCtrl->pDrv->minVoltage )
+	{
+		prtDevStop( PRT_ERR_LOW_VOLT );
+		return  ;
+	}
+	if( pPrtDevCtrl->pDrv->getVoltage() > pPrtDevCtrl->pDrv->maxVoltage )
+	{
+		prtDevStop( PRT_ERR_HIGH_VOLT );
+		return  ;
+	}
+	
+	cnt = sizeof(tPrtMotorCtrlTab)/sizeof(tPrtMotorCtrlTab[0]);
+	for(i = 0; i < cnt; i++)
+	{
+		if(pPrtDevCtrl->condition == tPrtMotorCtrlTab[i].condition)
+		{
+			ret = tPrtMotorCtrlTab[i].pFunc( pPrtDevCtrl );
+			if(ret != 0x00)
+			{
+				pPrtDevCtrl->last_err = ret;
+			}
+			break;
+		}
+	}
+
+}
+
+static void prtDevHeatTimerHandler(void)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+	
+	//pPrtDevCtrl->pDrv->stbControl(0);
+	pPrtDevCtrl->curBlock++;
+	//prt_dbg_add("H_BK", pPrtDevCtrl->curBlock);
+	
+	if(pPrtDevCtrl->curBlock < pPrtDevCtrl->pCur->blocks)
+	{
+		//pPrtDevCtrl->pDrv->stbControl(0);
+		prtDevGetBlockData(pPrtDevCtrl, 1, pPrtDevCtrl->curBlock);
+		prtDevSendAndLatchData( pPrtDevCtrl );
+		pPrtDevCtrl->pDrv->stbControl(1);
+
+		prt_dbg_add("HT_HT", pPrtDevCtrl->pCur->heatTime);
+		HeatTimerSet(pPrtDevCtrl->pCur->heatTime);
+	}
+	else
+	{
+		pPrtDevCtrl->curBlock = 0;
+		if(pPrtDevCtrl->halfDot == 0 && (pPrtDevCtrl->pDrv->mask & MASK_PRT_HEAT_TWINCE))
+		{
+			//prt_dbg_add("H_HALF", 1);
+			prtDevGetBlockData(pPrtDevCtrl, 1, pPrtDevCtrl->curBlock);
+		}
+		else	//send next line's first block
+		{
+			//prt_dbg_add("H_NEXT", 1);
+			prtDevGetBlockData(pPrtDevCtrl, 0, pPrtDevCtrl->curBlock);
+		}
+		pPrtDevCtrl->pDrv->load((unsigned char *) pPrtDevCtrl->dotBlock);
+		pPrtDevCtrl->heating = 0;
+		pPrtDevCtrl->pDrv->stbControl(0);
+		pPrtDevCtrl->pDrv->latch();		//disable stb first,
+	}
+}
+
+
+// --------------------------------------------------------------------------
+void prtInit(void)
+{
+	//memset(gpPrtDevCtrl, 0x00, sizeof(T_PrtDevCtrl));
+	gpPrtDevCtrl->pDrv = &tDrvPt48d;
+	prtInitCharDots();
+}
+
+int prtDevInit(unsigned int pre_step)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		Prt_Return ( PRT_ERR_BUSY );
+	}
+	
+	pPrtDevCtrl->pDrv->config();
+	pPrtDevCtrl->pDrv->init();
+
+	pPrtDevCtrl->stepCnt = 0;
+	pPrtDevCtrl->preStepCnt = pre_step * PRT_STEPS_PER_LINE;
+	pPrtDevCtrl->gray = 100;
+	
+	prtQueInit();
+	
+	prtTimerFckInit();
+	prtTimerInit(MOTOR);
+	prtTimerInit(HEAT);
+	//prtTimerStop(MOTOR);
+	//prtTimerStop(HEAT);
+	prtTimerHandlerRegister(MOTOR, prtDevMotorTimerHandler);
+	prtTimerHandlerRegister(HEAT, prtDevHeatTimerHandler);
+
+	prtAdcVoltStart();
+	prtAdcTempStart();
+
+	pPrtDevCtrl->inited = 1;
+	
+	prt_dbg_init();
+
+	Prt_Return ( PRT_OK );
+}
+
+int prtDevSetGray(int gray)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+	
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		Prt_Return ( PRT_ERR_BUSY );
+	}
+
+	if( gray >=50 && gray <= 250 )
+	{
+		pPrtDevCtrl->gray = gray;
+	}
+	else
+	{
+		pPrtDevCtrl->gray = 100;
+	}
+
+	Prt_Return ( PRT_OK );
+}
+
+int prtDevFill(unsigned char *data, unsigned int len)
+{
+	int i, ret;
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+	
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		//return ( PRT_ERR_BUSY );
+	}
+
+	if( prtDevCheckFillFinish() == 0x01 )
+	{
+		Prt_Return ( PRT_ERR_DIRTY_DATA );
+	}
+
+
+	if(data == NULL || len == 0 || len % 48 != 0)
+	{
+		Prt_Return ( PRT_ERR_PARAM );
+	}
+
+	ret = prtQueFillBuf(data, len);
+
+	Prt_Return ( ret ); 
+}
+
+int prtDevCheckCapacity(void)
+{
+	int ret;
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+	
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		//return ( PRT_ERR_BUSY );
+	}
+	
+	ret = prtQueCheckCapacity();
+	
+	return ( ret ); 
+}
+
+void prtDevSetFillFinish(void)
+{
+	gFinishFill = 1;
+}
+void prtDevClrFillFinish(void)
+{
+	gFinishFill = 0;
+}
+
+int prtDevStep(unsigned int step)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		Prt_Return ( PRT_ERR_BUSY );
+	}
+	
+	prtAdcVoltStart();
+	prtAdcTempStart();
+
+	pPrtDevCtrl->feedStepCnt = step * PRT_STEPS_PER_LINE;
+	pPrtDevCtrl->condition   = ePrtMotorStep;
+	pPrtDevCtrl->last_err    = PRT_ERR_BUSY;
+	pPrtDevCtrl->pDrv->powerControl( 1 );
+	
+	prtDevGetStepTime( pPrtDevCtrl );
+
+	prtTimerStart( MOTOR, 1000*200 );
+
+	Prt_Return ( PRT_OK );
+}
+
+int prtDevStart(unsigned int finish_step)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+	if( pPrtDevCtrl->last_err == PRT_ERR_BUSY )
+	{
+		Prt_Return ( PRT_ERR_BUSY );
+	}
+#if 0
+	if( pPrtDevCtrl->pDrv->getVoltage() < pPrtDevCtrl->pDrv->minVoltage )
+	{
+		prtDevStop( PRT_ERR_LOW_VOLT );
+		Prt_Return ( PRT_ERR_LOW_VOLT );
+	}
+	if( pPrtDevCtrl->pDrv->getVoltage() > pPrtDevCtrl->pDrv->maxVoltage )
+	{
+		prtDevStop( PRT_ERR_HIGH_VOLT );
+		Prt_Return ( PRT_ERR_HIGH_VOLT );
+	}
+	if( pPrtDevCtrl->pDrv->checkPaper() == 0x00 )	// have no paper
+	{
+		prtDevStop( PRT_ERR_NOPAPER );
+		Prt_Return ( PRT_ERR_NOPAPER );
+	}
+	if( pPrtDevCtrl->pDrv->getTemprature() > pPrtDevCtrl->pDrv->maxTemprature ) // overtemperature
+	{
+		prtDevStop( PRT_ERR_OVERHEAT );
+		Prt_Return ( PRT_ERR_OVERHEAT );
+	}
+#endif
+	prtAdcVoltStart();
+	prtAdcTempStart();
+
+	//pPrtDevCtrl->curStep       = 0;
+	pPrtDevCtrl->stepCnt       = 0;
+	pPrtDevCtrl->condition     = ePrtMotorInit;
+	pPrtDevCtrl->finishStepCnt = finish_step * PRT_STEPS_PER_LINE;
+	pPrtDevCtrl->last_err      = PRT_ERR_BUSY;
+	pPrtDevCtrl->pDrv->powerControl( 1 );
+	
+	pPrtDevCtrl->pCur = (T_DotLine *)&pPrtDevCtrl->line[0];
+	pPrtDevCtrl->pNext = (T_DotLine *)&pPrtDevCtrl->line[1];
+	
+	prtTimerStart( MOTOR, 1000*100 );
+
+	Prt_Return ( PRT_OK );
+}
+
+int prtDevGetStatus(void)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	if( pPrtDevCtrl == NULL )
+	{
+		Prt_Return ( PRT_ERR_NULL );
+	}
+	if( pPrtDevCtrl->pDrv == NULL )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NULL;
+	}
+	if( pPrtDevCtrl->inited == 0 )
+	{
+		pPrtDevCtrl->last_err = PRT_ERR_NOT_INITED;
+		Prt_Return ( PRT_ERR_NOT_INITED );
+	}
+
+	//Prt_Return ( pPrtDevCtrl->last_err );
+	return ( pPrtDevCtrl->last_err );
+}
+
+
+int prtDevStop(int err)
+{
+	T_PrtDevCtrl *pPrtDevCtrl;
+	pPrtDevCtrl = prtDevGetGlobalCtrl();
+
+	
+	//prt_dbg_show();
+
+	prtTimerStop( MOTOR );
+	prtTimerStop( HEAT );
+	prtTimerFckStop();
+	
+	prtAdcVoltStop();
+	prtAdcTempStop();
+
+	prtDevClrFillFinish();
+	
+	pPrtDevCtrl->pDrv->stbControl( 0 );
+	pPrtDevCtrl->pDrv->motorPower( 0 );
+	pPrtDevCtrl->pDrv->powerControl( 0 );
+
+	pPrtDevCtrl->heating = 0;
+	pPrtDevCtrl->stepCnt = 0;
+	pPrtDevCtrl->preStepCnt = 0;
+	pPrtDevCtrl->finishStepCnt = 0;
+	pPrtDevCtrl->feedStepCnt = 0;
+	
+	pPrtDevCtrl->last_err = err;
+	//pPrtDevCtrl->inited = 0;
+	
+	Prt_Return ( PRT_OK );
+}
+
+int prtDevPrintSalesSlip(unsigned int pre_step, unsigned int finish_step)
+{
+	int ret;
+
+	ret = prtDevInit( pre_step );
+	if(ret != PRT_OK)
+	{
+		Prt_Return ( ret );
+	}
+
+	ret = prtQueFckSet();
+
+	ret = prtDevStart( finish_step );
+	if(ret != PRT_OK)
+	{
+		Prt_Return ( ret );
+	}
+
+	Prt_Return ( PRT_OK );
+}
+
+int prt_dev_stop(int err)
+{
+	int ret;
+	
+	ret = prtDevStop( err );
+
+	Prt_Return ( ret );
+}
+
+// ----------------------- for test ---------------------
+static unsigned char prt_char_tab[] = {	
+#if 0
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,
+
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,0x0F,
+
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,0x3F,
+
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+#endif
+
+#if 1
+	// 24*24: 深圳九磊科技有限公司
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x18,0x00,0x00,0x03,0x0C,0x07,0x00,0x1C,0x00,0x00,0x00,0x03,0x80,0x06,0x03,0x80,
+	0x3C,0x0E,0x00,0x00,0xF0,0x00,0x00,0x00,0x30,0x00,0x07,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x0C,0x00,0x0C,0x03,0x0E,0x07,0x00,0x18,0x00,0x01,0xFF,0xFE,0x00,0x3F,0x03,0x00,
+	0x38,0x0C,0x00,0x00,0xE0,0x00,0x3F,0xBF,0xF8,0x00,0x73,0x00,0x07,0xFF,0xFE,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x0E,0x7F,0xFE,0x03,0x0C,0x67,0x00,0x18,0x00,0x00,0x0C,0x00,0x03,0xF8,0x03,0x00,
+	0x38,0x0C,0x00,0x00,0xC0,0x38,0x33,0x30,0x70,0x00,0xE3,0x00,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x06,0x60,0x18,0x03,0x0C,0x67,0x00,0x18,0x00,0x00,0x18,0x00,0x00,0x38,0x63,0x00,
+	0x38,0x0C,0x01,0xFF,0xFF,0xFC,0x33,0x30,0x70,0x00,0xC3,0x00,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x01,0xEC,0xF0,0x03,0x0C,0x67,0x00,0x18,0x00,0x00,0x3F,0xFC,0x00,0x38,0x3B,0x00,
+	0x3F,0x0C,0x70,0x01,0x80,0x00,0x36,0x30,0x70,0x01,0xC1,0x80,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x03,0x1C,0x70,0x03,0x0C,0x67,0x00,0x18,0x60,0x00,0x78,0x0C,0x00,0x38,0x3B,0x01,
+	0xFD,0xFF,0xC0,0x03,0x80,0x00,0x36,0x3F,0xF0,0x01,0x81,0xC0,0x00,0x01,0xCC,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x63,0x38,0x1C,0x03,0x7C,0x67,0x07,0xFF,0xE0,0x01,0xD8,0x0C,0x00,0x3F,0x03,0x00,
+	0x38,0x0C,0x00,0x03,0x01,0x80,0x36,0x30,0x70,0x03,0x80,0xC0,0x0F,0xFF,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x3B,0x33,0x9C,0x1F,0xCC,0x67,0x00,0x38,0x60,0x03,0x18,0x0C,0x03,0xFC,0x03,0x00,
+	0x38,0x0C,0x00,0x07,0xFF,0xC0,0x3C,0x30,0x70,0x03,0x00,0xE0,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1B,0xE3,0x80,0x03,0x0C,0x67,0x00,0x38,0x60,0x0E,0x1F,0xFC,0x00,0x38,0xC3,0x00,
+	0x38,0x0C,0x00,0x0E,0x01,0x80,0x36,0x30,0x70,0x06,0x18,0x70,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1E,0x03,0x80,0x03,0x0C,0x67,0x00,0x30,0x60,0x00,0x00,0x00,0x00,0x78,0x73,0x00,
+	0x3F,0xFF,0xE0,0x1E,0x01,0x80,0x33,0x3F,0xF0,0x0C,0x1C,0x3C,0x03,0xFF,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x06,0x03,0x8E,0x03,0x0C,0x67,0x00,0x30,0x60,0x00,0x06,0x00,0xC0,0x7E,0x33,0x00,
+	0x3C,0x60,0xC0,0x3E,0x01,0x80,0x33,0x3C,0x60,0x18,0x38,0x1F,0x03,0x07,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x06,0x7F,0xF8,0x03,0x0C,0x67,0x00,0x30,0x60,0x07,0xFF,0xFF,0x80,0xFF,0x33,0x61,
+	0xF8,0x61,0xC0,0x77,0xFF,0x80,0x31,0xB6,0x38,0x30,0x30,0x0C,0x03,0x07,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x0C,0x0F,0xC0,0x03,0x0C,0x67,0x00,0x70,0x60,0x00,0xE0,0x18,0x00,0xFB,0x03,0xF1,
+	0xB8,0x31,0x80,0xC6,0x01,0x80,0x31,0xB6,0x38,0x00,0x70,0x00,0x03,0x07,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x0C,0x0F,0xE0,0x03,0x0C,0x67,0x00,0x60,0x60,0x00,0xC0,0x30,0x01,0xB8,0x1F,0x80,
+	0x38,0x33,0x81,0x86,0x01,0x80,0x31,0xB3,0xE0,0x00,0x60,0x00,0x03,0x07,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x7C,0x1B,0xF0,0x03,0xFC,0x67,0x00,0x60,0x60,0x01,0xFE,0x7F,0x81,0xBB,0xF3,0x00,
+	0x38,0x1B,0x00,0x06,0x01,0x80,0x3F,0xB3,0x80,0x00,0xC3,0x00,0x03,0xFF,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1C,0x3B,0xB0,0x07,0x98,0x67,0x00,0xC0,0x61,0x83,0xCE,0x61,0x83,0x38,0x03,0x00,
+	0x38,0x1F,0x00,0x07,0xFF,0x80,0x37,0x31,0x80,0x01,0x81,0xC0,0x03,0x07,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1C,0x73,0x9C,0x3E,0x18,0x67,0x00,0xC0,0x61,0x83,0xCE,0xE1,0x86,0x38,0x03,0x00,
+	0x38,0x0E,0x00,0x06,0x01,0x80,0x30,0x31,0xC0,0x03,0x80,0xE0,0x03,0x06,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1C,0xC3,0x9E,0x18,0x30,0x67,0x01,0x80,0x61,0x8F,0xCF,0xE1,0x80,0x38,0x03,0x00,
+	0x38,0x1E,0x00,0x06,0x01,0x80,0x30,0x37,0xE0,0x03,0x00,0x60,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1D,0x83,0x8C,0x00,0x60,0x67,0x03,0x00,0x61,0x81,0xCF,0x61,0x80,0x38,0x03,0x00,
+	0x38,0x73,0x80,0x06,0x01,0x80,0x30,0x3C,0x78,0x0F,0xFF,0xF0,0x00,0x00,0x0C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x1C,0x03,0x80,0x00,0xC0,0x07,0x06,0x00,0x7F,0xC1,0xFE,0x7F,0x80,0x38,0x03,0x00,
+	0xF8,0xC1,0xF8,0x06,0x0F,0x80,0x30,0x78,0x3C,0x07,0x00,0x30,0x00,0x00,0x7C,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x03,0x80,0x01,0x80,0x07,0x0C,0x00,0x00,0x01,0xCC,0x60,0x00,0x38,0x03,0x00,
+	0x77,0x80,0x70,0x06,0x03,0x80,0x30,0x30,0x00,0x00,0x00,0x30,0x00,0x00,0x18,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+#else
+// 16*16: 深圳九磊科技有限公司
+0x00,0x00,0x11,0x04,0x04,0x00,0x7F,0xFC,0x08,0x10,0x10,0x20,0x02,0x00,0x00,0x00,
+0x00,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+0x27,0xFC,0x11,0x24,0x04,0x00,0x04,0x00,0x1D,0x10,0x10,0x20,0x02,0x00,0x7B,0xF8,
+0x04,0x80,0x3F,0xF8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+0x14,0x04,0x11,0x24,0x04,0x00,0x08,0x00,0xF0,0x90,0x10,0x20,0xFF,0xFE,0x4A,0x08,
+0x04,0x80,0x00,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+0x14,0xA4,0x11,0x24,0x04,0x00,0x1F,0xF0,0x10,0x90,0x13,0xFE,0x04,0x00,0x52,0x08,
+0x08,0x40,0x00,0x08,0x10,0xF8,0x3E,0xF8,0xFC,0xFC,0x3C,0xE7,0x7C,0x3E,0xEE,0xE0,
+0xEE,0xC7,0x38,0xFC,0x38,0xFC,0x3E,0xFE,0xE7,0xE7,0xD6,0xE7,0xEE,0x7E,0x10,0x10,
+
+0x81,0x10,0x11,0x24,0x7F,0xE0,0x28,0x10,0x10,0x10,0xFC,0x20,0x04,0x00,0x53,0xF8,
+0x08,0x40,0x7F,0xE8,0x10,0x44,0x42,0x44,0x42,0x42,0x44,0x42,0x10,0x08,0x44,0x40,
+0x6C,0x62,0x44,0x42,0x44,0x42,0x42,0x92,0x42,0x42,0x92,0x42,0x44,0x84,0x10,0x10,
+
+0x42,0x08,0xFD,0x24,0x04,0x20,0x48,0x10,0xFD,0x10,0x10,0x20,0x0F,0xF0,0x62,0x08,
+0x10,0x20,0x00,0x08,0x18,0x44,0x42,0x42,0x48,0x48,0x44,0x42,0x10,0x08,0x48,0x40,
+0x6C,0x62,0x82,0x42,0x82,0x42,0x42,0x10,0x42,0x42,0x92,0x24,0x44,0x04,0x18,0x18,
+
+0x40,0x40,0x11,0x24,0x04,0x20,0x8F,0xF0,0x10,0x90,0x10,0x20,0x08,0x10,0x52,0x08,
+0x20,0x10,0x00,0x08,0x28,0x44,0x80,0x42,0x48,0x48,0x80,0x42,0x10,0x08,0x50,0x40,
+0x6C,0x52,0x82,0x42,0x82,0x42,0x40,0x10,0x42,0x44,0x92,0x24,0x28,0x08,0x28,0x28,
+
+0x10,0x40,0x11,0x24,0x04,0x20,0x00,0x00,0x38,0x90,0x15,0xFC,0x18,0x10,0x4B,0xF8,
+0x42,0x08,0x1F,0x88,0x28,0x78,0x80,0x42,0x78,0x78,0x80,0x42,0x10,0x08,0x70,0x40,
+0x6C,0x52,0x82,0x42,0x82,0x7C,0x20,0x10,0x42,0x24,0x92,0x18,0x28,0x08,0x28,0x28,
+
+0x17,0xFC,0x11,0x24,0x08,0x20,0x7E,0xFE,0x34,0x10,0x18,0x84,0x2F,0xF0,0x4A,0x44,
+0x82,0x06,0x10,0x88,0x24,0x44,0x80,0x42,0x48,0x48,0x80,0x7E,0x10,0x08,0x50,0x40,
+0x54,0x4A,0x82,0x7C,0x82,0x48,0x18,0x10,0x42,0x24,0xAA,0x18,0x10,0x10,0x24,0x24,
+
+0x20,0x40,0x11,0x24,0x08,0x20,0x10,0x20,0x50,0x1E,0x30,0x88,0x48,0x10,0x4A,0x48,
+0x04,0x00,0x10,0x88,0x3C,0x42,0x80,0x42,0x48,0x48,0x8E,0x42,0x10,0x08,0x48,0x40,
+0x54,0x4A,0x82,0x40,0x82,0x48,0x04,0x10,0x42,0x28,0xAA,0x18,0x10,0x20,0x3C,0x3C,
+
+0xE0,0xE0,0x11,0x24,0x08,0x20,0x20,0x40,0x53,0xF0,0xD0,0x48,0x88,0x10,0x6A,0x30,
+0x04,0x40,0x10,0x88,0x44,0x42,0x80,0x42,0x40,0x40,0x84,0x42,0x10,0x08,0x48,0x40,
+0x54,0x4A,0x82,0x40,0xB2,0x44,0x02,0x10,0x42,0x28,0x6C,0x24,0x10,0x20,0x44,0x44,
+
+0x21,0x50,0x1D,0x24,0x10,0x22,0x7E,0xFC,0x90,0x10,0x10,0x50,0x0F,0xF0,0x52,0x20,
+0x08,0x20,0x10,0x88,0x42,0x42,0x42,0x42,0x42,0x40,0x44,0x42,0x10,0x08,0x44,0x40,
+0x54,0x46,0x82,0x40,0xCA,0x44,0x42,0x10,0x42,0x18,0x44,0x24,0x10,0x42,0x42,0x42,
+
+0x22,0x48,0xE1,0x24,0x10,0x22,0xA3,0x44,0x10,0x10,0x10,0x20,0x08,0x10,0x42,0x10,
+0x10,0x20,0x1F,0x88,0x42,0x44,0x44,0x44,0x42,0x40,0x44,0x42,0x10,0x08,0x44,0x42,
+0x54,0x46,0x44,0x40,0x4C,0x42,0x42,0x10,0x42,0x10,0x44,0x42,0x10,0x42,0x42,0x42,
+
+0x2C,0x46,0x42,0x24,0x20,0x22,0x22,0x44,0x10,0x10,0x10,0x50,0x08,0x10,0x42,0x88,
+0x3F,0xF0,0x10,0x88,0xE7,0xF8,0x38,0xF8,0xFC,0xE0,0x38,0xE7,0x7C,0x08,0xEE,0xFE,
+0xD6,0xE2,0x38,0xE0,0x38,0xE3,0x7C,0x38,0x3C,0x10,0x44,0xE7,0x38,0xFC,0xE7,0xE7,
+
+0x20,0x40,0x02,0x04,0x40,0x1E,0x3E,0x7C,0x10,0x10,0x51,0x88,0x08,0x50,0x43,0x06,
+0x10,0x10,0x00,0x28,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x88,0x00,0x00,
+0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+
+0x00,0x40,0x04,0x04,0x80,0x00,0x22,0x44,0x10,0x10,0x26,0x06,0x08,0x20,0x42,0x00,
+0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xF0,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+#endif
+};
+
+void prtDevInit_test(void)
+{
+	int ret;
+	unsigned int pre_step;
+
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+
+	ret = prtDevInit( pre_step );
+
+	uart_print("prtDevInit, ret: %d\r\n", ret);
+}
+
+void prtDevFill_test(void)
+{
+	int i, ret;
+
+	//for( i = 0; i < 30; i++)
+	//while(prtQueCheckCapacity() != 0)
+	{
+		ret = prtDevFill(prt_char_tab, sizeof(prt_char_tab));
+		if(ret != 0)
+		{
+			uart_print("prtDevFill, err: %d\r\n", ret);
+			//break;
+		}
+	}
+
+	uart_print("prtDevFill, ret: %d\r\n", ret);
+}
+
+void prtDevStep_test(void)
+{
+	int i, ret;
+	unsigned int feed_step;
+	
+	if(xxx_input_int("prtDevStep(feed_step)::", &feed_step) < 0)
+	{
+		return ;
+	}
+
+	ret = prtDevStep( feed_step );
+
+	uart_print("prtDevStep, ret: %d\r\n", ret);
+}
+
+void prtDevSetFillFinish_test(void)
+{
+	prtDevSetFillFinish();
+
+	uart_print("prtDevSetFillFinish, ok!!!\r\n");
+}
+
+void prtDevClrFillFinish_test(void)
+{
+	prtDevClrFillFinish();
+	
+	uart_print("prtDevClrFillFinish, ok!!!\r\n");
+}
+
+void prtDevStart_test(void)
+{
+	int ret;
+	unsigned int finish_step;
+	
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+
+	ret = prtDevStart( finish_step );
+
+	uart_print("prtDevStart, ret: %d\r\n", ret);
+}
+
+
+
+void prtDevLoop_test(void)
+{
+	int i, ret;
+	unsigned int pre_step = 10;
+	unsigned int finish_step = 10;
+	unsigned char data[48];
+	unsigned int cnt = 0;
+	unsigned char ch;
+	
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+
+	//for( i = 0; i < 1000; i++)
+	i = 0;
+	while(1)
+	{
+		ch = ( 1 << (i % 8));
+		memset(data, ch, sizeof(data));
+		
+		uart_print("----- loop(%d) --------\r\n", i++);
+		
+		ret = prtDevInit( pre_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+		
+		while(prtQueCheckCapacity() != 0)
+		{
+			//ret = prtDevFill(prt_char_tab, sizeof(prt_char_tab));
+			ret = prtDevFill(data, sizeof(data));
+			if(ret != 0)
+			{
+				//uart_print("prtDevFill, err: %d\r\n", ret);
+				break;
+			}
+		}
+		
+		prtDevSetFillFinish();
+		
+		ret = prtDevStart( finish_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		while((ret = prtDevGetStatus()) == PRT_ERR_BUSY)
+			;
+
+		if(ret == PRT_ERR_OVERHEAT)
+		{
+			DelayMs(60000);
+		}
+
+		DelayMs(1000);
+	}
+}
+
+void prtDevFck_test(void)
+{
+	int i, ret;
+	unsigned int pre_step = 200;
+	unsigned int finish_step = 30;
+	unsigned char fck[48];
+	int val;
+	
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+
+	if(xxx_input_int("prtDevFck(val)::", &val) < 0)
+	{
+		return ;
+	}
+
+	//for( i = 0; i < 1000; i++)
+	{
+		//uart_printk("----- loop(%d) --------\r\n", i);
+		ret = prtDevInit( pre_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		memset(fck, val, sizeof(fck));
+		while(prtQueCheckCapacity() != 0)
+		{
+			ret = prtDevFill(fck, sizeof(fck));
+			if(ret != 0)
+			{
+				//uart_print("prtDevFill, err: %d\r\n", ret);
+				break;
+			}
+		}
+		
+		ret = prtDevStart( finish_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		while(1)
+		{
+			if(prtQueCheckCapacity() != 0)
+			{
+				ret = prtDevFill(fck, sizeof(fck));
+				if(ret != 0)
+				{
+					//uart_print("prtDevFill, err: %d\r\n", ret);
+					//break;
+				}
+			}
+		}
+
+		//DelayMs(5000);
+	}
+}
+
+void prtDevBuff_test(void)
+{
+	int i, ret;
+	int pre_step = 100;
+	int finish_step = 100;
+	int gray = 100;
+	unsigned char fck[48];
+	int val = 255;
+	
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+	
+	if(xxx_input_int("prtDevSetGray(gray)::", &gray) < 0)
+	{
+		return ;
+	}
+
+
+	if(xxx_input_int("prtDevFck(val)::", &val) < 0)
+	{
+		return ;
+	}
+	
+	//for( i = 0; i < 1000; i++)
+	{
+		//uart_printk("----- loop(%d) --------\r\n", i);
+		ret = prtDevInit( pre_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		ret = prtDevSetGray(gray);
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		memset(fck, val, sizeof(fck));
+		while(prtQueCheckCapacity() != 0)
+		{
+			ret = prtDevFill(fck, sizeof(fck));
+			if(ret != 0)
+			{
+				//uart_print("prtDevFill, err: %d\r\n", ret);
+				//break;
+			}
+		}
+
+		prtDevSetFillFinish();
+		
+		ret = prtDevStart( finish_step );
+		if(ret != 0x00)
+		{
+			return ;
+		}
+
+		while( (ret = prtDevGetStatus()) == PRT_ERR_BUSY)
+			;
+
+		uart_print("prtDev Print Finish, ret:%d\r\n", ret);
+		
+		while(0)
+		{
+			if(prtQueCheckCapacity() != 0)
+			{
+				ret = prtDevFill(fck, sizeof(fck));
+				if(ret != 0)
+				{
+					//uart_print("prtDevFill, err: %d\r\n", ret);
+					//break;
+				}
+			}
+		}
+
+		//DelayMs(5000);
+	}
+}
+
+void prtDevStop_test(void)
+{
+	int ret;
+
+	ret = prtDevStop( 0 );
+
+	uart_print("prtDevStop, ret: %d\r\n", ret);
+}
+
+void prtDevPrintSalesSlip_test(void)
+{
+	int ret;
+	unsigned int pre_step;
+	unsigned int finish_step;
+	unsigned int t1, t2, s, e, d;
+	
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+	
+	ret = prtDevPrintSalesSlip(pre_step, finish_step);
+	s = t1 = PRT_GET_FCK_TICK();
+	while(prtDevGetStatus() == PRT_ERR_BUSY)
+		;
+	e = t2 = PRT_GET_FCK_TICK();
+	
+	d = (e > s)?(e - s):(0xffffffff-s+e);
+	uart_print("prtDevPrintSalesSlip, ret: %d(Time:<s:%d,e:%d> %dms)\r\n", ret, s, e, (d)*185/10000/1000);
+}
+
+void prtDevSetGray_test(void)
+{
+	int gray;
+	int ret;
+	
+	if(xxx_input_int("prtDevSetGray(gray)::", &gray) < 0)
+	{
+		return ;
+	}
+
+	ret = prtDevSetGray(gray);
+	
+	uart_print("prtDevSetGray(%d), ret: %d\r\n", gray, ret);
+	
+}
+
+void prtDevGetStatus_test(void)
+{
+	int ret;
+
+	ret = prtDevGetStatus();
+	
+	uart_print("prtDevGetStatus, ret: %d\r\n", ret);
+}
+
+
+
+void prtDevGetUs_test(void)
+{
+	unsigned int t1, t2;
+
+	t1 = PRT_GET_FCK_TICK();
+	DelayUs( 500 );
+	t2 = PRT_GET_FCK_TICK();
+
+	uart_print("t1: %d, t2: %d, t2-t1: %d, (t2-t1)*185/10000: %d\r\n", t1, t2, t2-t1, (t2-t1)*185/10000);
+}
+
+int have_no_data()
+{
+	return 0;
+	// or
+	return 1;
+}
+
+int have_more_data()
+{
+	return 1;
+	// or
+	return 0;
+}
+
+void prtDevPrintLoop_test(void)
+{
+	unsigned char data[48];
+	unsigned int val, ms, max_line;
+	int i, lines;
+	int ret;
+
+	if(xxx_input_int("prtDevPrint(val)::", &val) < 0)
+	{
+		return ;
+	}
+	if(xxx_input_int("prtDevPrint(delay: ms)::", &ms) < 0)
+	{
+		return ;
+	}
+	if(xxx_input_int("prtDevPrint(max_line)::", &max_line) < 0)
+	{
+		return ;
+	}
+	
+	memset(data, (unsigned char)val, sizeof(data));
+	
+	prtDevInit( 10 );
+
+	// 开始时，尽可能填充多数据
+	lines = prtQueCheckCapacity();
+	for(i = 0; i < lines; i++)
+	{
+		prtDevFill(data, sizeof(data));
+	}
+
+	// 如果buff本身足够存放，不需要边打印边填充，则设置填充完成标识
+	if(have_no_data()) 
+	{
+		prtDevSetFillFinish();
+	}
+
+	prtDevStart( 0 );
+
+#if 1
+	// 如果需要边打印边填充，则启动打印一会(经验值)之后继续填充剩余数据
+	DelayMs(500);
+
+	do {
+		lines = prtQueCheckCapacity();
+
+		for(i = 0; i < lines && i < max_line; i++)
+		{
+			prtDevFill(data, sizeof(data));
+		}
+		DelayMs(ms);
+	} while( have_more_data() && prtDevGetStatus() == PRT_ERR_BUSY); // 此时打印机忙为正常状态，否则就已经不正常了
+
+	prtDevSetFillFinish();
+#endif
+}
+
+
+void prtDevBuffLoop_test(void)
+{
+	int i, j, cnt, ret;
+	int pre_step = 200;
+	int finish_step = 30;
+	int gray = 150;
+	unsigned char fck[48];
+	int val;
+	// 12.5%
+	unsigned char tmp1[] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
+	// 25%
+	unsigned char tmp2[] = {0xC0, 0x30, 0x0C, 0x03, 0xC0, 0x30, 0x0C, 0x03};
+	
+	if(xxx_input_int("prtDevInit(pre_step)::", &pre_step) < 0)
+	{
+		return ;
+	}
+	if(xxx_input_int("prtDevStart(finish_step)::", &finish_step) < 0)
+	{
+		return ;
+	}
+	if(xxx_input_int("prtDevSetGray(gray)::", &gray) < 0)
+	{
+		return ;
+	}
+	if(xxx_input_int("prtDevFck(val)::", &val) < 0)
+	{
+		return ;
+	}
+
+	cnt = 0;
+	while( 1 )
+	{
+		uart_printk("-------- loop(%d) --------\r\n", ++cnt);
+		
+		ret = prtDevInit( pre_step );
+		if(ret != 0x00)
+		{
+			uart_printk("prtDevInit, err: %d\r\n", ret);
+			return ;
+		}
+
+		ret = prtDevSetGray(gray);
+		if(ret != 0x00)
+		{
+			uart_printk("prtDevSetGray, err: %d\r\n", ret);
+			return ;
+		}
+
+		memset(fck, 0xFF, sizeof(fck));
+		for(j = 0; j < 48; j++)
+		{
+			ret = prtDevFill(fck, sizeof(fck));
+		}
+		
+		while(prtQueCheckCapacity() != 0)
+		{
+			for(j = 0; j < sizeof(tmp1); j++)
+			{
+				if(val % 2)
+					memset(fck, tmp2[j], sizeof(fck));
+				else
+					memset(fck, tmp1[j], sizeof(fck));
+				
+				for(i = 0; i < 8; i++)
+				{
+					ret = prtDevFill(fck, sizeof(fck));
+				}
+			}
+		}
+
+		prtDevSetFillFinish();
+		
+		ret = prtDevStart( finish_step );
+		if(ret != 0x00)
+		{
+			uart_printk("prtDevStart, err: %d\r\n", ret);
+			return ;
+		}
+
+		while((ret = prtDevGetStatus()) == PRT_ERR_BUSY)
+			;
+
+		if( ret == 0x00)
+		{
+			uart_printk("prtDev Print Finish, OK\r\n");
+		}
+		else
+		{
+			uart_printk("prtDev Print Finish, ERRRO, ret:%d\r\n", ret);
+			switch( ret )
+			{
+				case PRT_ERR_OVERHEAT:
+					DelayMs( 60000 );
+					break;
+				case PRT_ERR_LOW_VOLT:
+					DelayMs( 10000 );
+					break;
+				case PRT_ERR_HIGH_VOLT:
+					DelayMs( 10000 );
+					break;
+				case PRT_ERR_NOPAPER:
+					DelayMs( 60000 );
+					break;					
+				case PRT_ERR_NOT_INITED:
+				case PRT_ERR_PARAM:
+				case PRT_ERR_NULL:
+				case PRT_ERR_NODATA:
+				case PRT_ERR_BUF_FULL:
+				case PRT_ERR_DIRTY_DATA:
+				case PRT_ERR_CONTROL:
+				case PRT_ERR_DAMAGE:
+					//uart_printk("prtDev Print Finish, unknown what the fck!!!\r\n");					
+					break;
+				default:
+					break;
+			}
+		}
+
+		DelayMs( 2000 );
+	}
+}
+
+
+void prt_dev_api_test(void)
+{	
+	ST_MENU_OPT tMenuOpt[] = {
+		" prt_dev_api_test ", NULL,
+		"prtDevBuff_test", prtDevBuff_test,
+		"prtDevBuffLoop_test", prtDevBuffLoop_test,
+		"prtDevInit_test", prtDevInit_test,
+		"prtDevFill_test", prtDevFill_test,
+		"prtDevStep_test", prtDevStep_test,
+		"prtDevStart_test", prtDevStart_test,
+		"prtDevSetFillFinish_test", prtDevSetFillFinish_test,
+		"prtDevClrFillFinish_test", prtDevClrFillFinish_test,
+		"prtDevSetGray_test", prtDevSetGray_test,
+		"prtDevGetStatus_test", prtDevGetStatus_test,
+		"prtDevStop_test", prtDevStop_test,
+		"prtDevFck_test", prtDevFck_test,
+		"prtDevBuff_test", prtDevBuff_test,
+		"prtDevLoop_test", prtDevLoop_test,
+		"prtDevGetUs_test", prtDevGetUs_test,
+		"prtDevPrintSalesSlip_test", prtDevPrintSalesSlip_test,
+		"prtDevPrintLoop_test", prtDevPrintLoop_test,
+	};
+
+	xxx_MenuSelect(tMenuOpt, sizeof(tMenuOpt)/sizeof(tMenuOpt[0]));
+}
+
+
+
+
