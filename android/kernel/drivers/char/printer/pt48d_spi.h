@@ -17,6 +17,10 @@ typedef struct _pt48d_spi_data
 {
         spinlock_t lock;
 
+        int dpwr_en;
+        int prn_strobe;
+        int prn_latch;
+
         struct class *prn_class;
         struct device *prn_device;
 

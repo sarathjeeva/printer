@@ -142,8 +142,31 @@ static struct attribute_group spi_attribute_group = {
 
 static int pt48d_spi_probe(struct spi_device *spi)
 {
+	int32_t rc = 0;
+	pt48d_spi_data *info = spi_data;
+	struct device_node *of_node = spi->dev.of_node;
+
 	DBG(">>> [%s]: Entering... \n", __func__);
 	
+	info->dpwr_en = of_get_named_gpio(of_node, "prn-dpwr-en", 0);
+	if(info->dpwr_en < 0){
+		DBG(">>> Looking up dpwr_en failed.\n");
+	}else{
+		rc = gpio_request(info->dpwr_en, "DPWR_EN");
+		if(rc){
+			DBG(">>> Failed to request gpio %d, rc = %d\n", info->dpwr_en, rc);
+			return rc;
+		}
+		DBG(">>> Request dpwr_en gpio %d success\n", info->dpwr_en);
+		rc = gpio_direction_output(info->dpwr_en, 1);
+		if(rc){
+			DBG(">>> Failed to set gpio %d, rc = %d\n", info->dpwr_en, rc);
+			return rc;
+		}else{
+			DBG(">>> Set dpwr_en gpio %d success\n", info->dpwr_en);
+		}
+	}
+
 	spi->bits_per_word = 8;
 	
 	spi_data->prn_spidev = spi;

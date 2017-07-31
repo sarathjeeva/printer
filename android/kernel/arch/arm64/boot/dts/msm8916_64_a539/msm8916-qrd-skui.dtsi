@@ -27,12 +27,10 @@
 	gpio-leds {
 		compatible = "gpio-leds";
 		status = "okay";
-		pinctrl-names = "default";
-		pinctrl-0 = <&button_backlight_off>;
 
-		keypad-backlight {
-			gpios = <&msm_gpio 62 0>;
-			label = "button-backlight";
+		green-led {
+			gpios = <&pm8916_gpios 2 0>;
+			label = "green";
 			linux,default-trigger = "none";
 		};
 	};
@@ -42,24 +40,21 @@
 		sec-power = <&msm_gpio 37 0>;
 		sec-reset = <&msm_gpio 98 0>;
 		sec-wakeup = <&msm_gpio 118 0>;
+		sec-buzzer = <&msm_gpio 109 0>;
 	};
 
 	printer-pt48d {
 		compatible = "printer,pt48d";
-		prn-steps = <48>;
 		prn-dpwr-en = <&msm_gpio 17 0>;
 		prn-ppwr-en = <&msm_gpio 16 0>;
 		prn-mctl-a = <&msm_gpio 115 0>;
 		prn-mctl-na = <&msm_gpio 111 0>;
 		prn-mctl-b = <&msm_gpio 116 0>;
 		prn-mctl-nb = <&msm_gpio 114 0>;
-		prn-mosi = <&msm_gpio 8 0>;
 		prn-strobe = <&msm_gpio 9 0>;
 		prn-latch = <&msm_gpio 10 0>;
-		prn-clk = <&msm_gpio 11 0>;
-		prn-th-alarm = <&msm_gpio 14 0>;
 	};
-	
+
 	sound {
 		compatible = "qcom,msm8x16-audio-codec";
 		qcom,model = "msm8x16-skui-snd-card";
@@ -116,6 +111,28 @@
 	};
 };
 
+/*
+&spi_6 {
+	pt48d-spi@0 {
+		compatible = "printer,pt48d-spi";
+		reg = <0>;
+		spi-max-frequency = <5000000>;
+
+	};
+};
+*/
+
+&spi_3 {
+	pt48d-spi@0 {
+		compatible = "printer,pt48d-spi";
+		reg = <0>;
+		spi-max-frequency = <5000000>;
+		prn-dpwr-en = <&msm_gpio 17 0>;
+		prn-strobe = <&msm_gpio 9 0>;
+		prn-latch = <&msm_gpio 10 0>;
+	};
+};
+
 &pm8916_mpps {
 	mpp@a300 { /* MPP 4 */
 		/* Backlight PWM */
@@ -140,7 +157,6 @@
 	qcom,num-grp-pins = <1>;
 	qcom,pins = <&gp 24>;
 };
-
 
 &mdss_dsi0 {
 	qcom,dsi-pref-prim-pan = <&dsi_huashi_ili9881c_720_vid>;
@@ -244,4 +260,44 @@
 	interrupt-names = "hc_irq", "pwr_irq";
 	/delete-property/ cd-gpios;
 };
+
+
+&spmi_bus {
+	qcom,pm8916@0 {
+		qcom,leds@a100 {
+			status = "okay";
+			qcom,led_mpp_2 {
+				label = "mpp";
+				linux,name = "red";
+				linux,default-trigger = "none";
+				qcom,default-state = "off";
+				qcom,max-current = <40>;
+				qcom,current-setting = <5>;
+				qcom,id = <6>;
+				qcom,mode = "manual";
+				qcom,source-sel = <1>;
+				qcom,mode-ctrl = <0x10>;
+			};
+			
+			/*
+            qcom,led_mpp_2{
+                label = "mpp";
+                linux,name = "red";
+                linux,default-trigger = "none";
+                qcom,default-state = "off";
+                qcom,max-current = <40>;
+                qcom,current-setting = <5>;
+                qcom,id = <6>;
+                qcom,mode = "pwm";
+                qcom,source-sel = <8>;
+                qcom,mode-ctrl = <0x60>;
+                qcom,vin-ctrl=<3>;
+                pwms = <&pm8916_pwm 0 0>;
+                qcom,pwm-us = <100>; //setup 0.0001s 
+            };
+			*/
+		};
+	};
+};
+
 
