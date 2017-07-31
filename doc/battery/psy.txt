@@ -1,0 +1,21 @@
+name，该PSY的名称；
+type，该PSY的类型，枚举型，包括：battery、USB charger等等（后面会详细介绍）；
+properties，该PSY具有的属性列表，枚举型（后面会详细介绍）； 
+num_properties，属性的个数；
+get_property/set_property，PSY driver需要重点实现的两个回调函数，用于获取/设置属性值；
+property_is_writeable，返回指定的属性值是否可写（用于sysfs）；
+set_charged，该回调函数的应用场景有点奇怪：外部模块通知PSY driver，该PSY设备的状态改变了。自己改变了自己不知道，要外部通知，希望大家在实际工作中不要遇到，不然太纠结了；
+tzd/tcd，如果该PSY具有温度等属性，则需要借助linux generic thermal sysfs drivers（温控子系统）的框架，注册相应的thermal设备，后面会详细介绍；
+led triggers，如果配置了CONFIG_LEDS_TRIGGERS，则调用linux led class的接口，注册相应的LED设备，用于PSY状态指示；
+dev/of_node，用于保存device、of_node等指针。
+
+supplied_from，一个字符串数组，保存了向该PSY供电的PSY列表，也称作supply（提供者）。从另一个方向，组织PSY之间的级联关系； 
+num_supplies，supply的个数；
+
+supplied_to，一个字符串数组，保存了由该PSY供电的PSY列表，以此可将PSY组织成相互级联的PSY链。这些“被供电”的PSY，称作supplicant（客户端、乞求者）； 
+num_supplicants， supplicant的个数；
+
+external_power_changed，当一个PSY设备存在supply PSY，且该supply PSY的属性发生改变（如online、offline）时，power supply core会调用该回调函数，通知PSY driver，以便让它做出相应的处理；
+
+changed_work/changed_lock/changed，一个用于处理状态改变的workqueue，主要思路是：当该PSY的状态发生改变，启动一个workqueue，查询并通知所有的supplicants；
+
