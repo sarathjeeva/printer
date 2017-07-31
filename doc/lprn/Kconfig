@@ -1,0 +1,11 @@
+#
+# RTC class/drivers configuration
+#
+
+config PAXPRN_LIB
+	tristate "PAX PRN Driver"
+	default y
+	help
+	This is the PAX PRN driver.
+
+

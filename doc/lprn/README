@@ -1,0 +1,2 @@
+make KERNELDIR=/home/wanglin/mywork/android_d800/kernel_imx CROSS_COMPILE=/home/wanglin/mywork/android_d800/prebuilt/linux-x86/toolchain/arm-eabi-4.4.0/bin/arm-eabi- ARCH=arm
+
